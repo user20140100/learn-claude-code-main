@@ -1,0 +1,66 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.whl
+
+# Virtual environments
+.venv/
+env/
+venv/
+ENV/
+
+# Conda
+condaenv.*.yaml
+condaenv.*.yml
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Environment
+.env
+.env.local
+
+# Worktrees & Sandboxes (git worktrees + SWE-bench sandboxes)
+.worktrees/
+.sandboxes/
+.sessions/
+.transcripts/
+.tasks/
+
+# Test artifacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# SWE-bench eval data
+swe_bench_eval/SWE-bench/
+swe_bench_eval/deps/
+swe_bench_eval/cache/
+swe_bench_eval/predictions*.jsonl
+swe_bench_eval/eval_results.json
+swe_bench_eval/test_result.json
+
+# Models
+*.pth
+*.pt
+*.bin
+*.safetensors
+
+# OS
+.DS_Store
+Thumbs.db
