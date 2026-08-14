@@ -291,3 +291,46 @@ ANTHROPIC_BASE_URL=https://dashscope.aliyuncs.com/apps/anthropic
 ```
 
 这样 Trae 内置终端和代码跳转都会自动使用 `.venv`，避免误用系统 Python。
+
+## ⚠️ 代码安全规范（必读）
+
+本项目运行在 Trae Sandbox 环境中，**Sandbox 会不定期重置工作区**，导致所有未提交到 Git 的修改丢失。为避免数据丢失，请严格遵守以下规范：
+
+### 强制规则
+
+1. **修改前必提交**：在任何文件修改之前，先执行 `git add -A && git commit -m "wip: 描述"` 保存当前状态。
+2. **频繁推送**：每次完成一个逻辑单元（一个函数、一个工具、一个阶段），立即 `git push` 到远端。
+3. **大改动分段提交**：禁止一次性修改超过 500 行代码而不提交。每完成一个独立功能点就提交一次。
+
+### 安全操作清单
+
+```bash
+# 操作前检查状态
+git status --short | head -20
+
+# 修改后立即提交
+git add <修改的文件> && git commit -m "feat: 描述" && git push
+
+# 重要修改前备份到 GitHub
+git diff > /tmp/backup_$(date +%s).diff
+```
+
+### 禁止行为
+
+- ❌ 禁止在执行长时间任务（>60秒）前不提交代码
+- ❌ 禁止一次性编辑多个相关文件后集中提交（应逐文件提交）
+- ❌ 禁止在工作区有大量未提交修改时重启终端或切换会话
+- ❌ 禁止依赖本地文件做持久化存储（所有持久数据必须 push 到 Git）
+
+### 恢复流程（如发生代码丢失）
+
+```bash
+# 1. 从 GitHub 恢复最新版本
+git pull origin main
+
+# 2. 从备份恢复（如有临时 diff 文件）
+git apply /tmp/backup_*.diff
+
+# 3. 从 s20-project.zip 恢复基础版本
+unzip -o /home/hongchang/code/yyh/s20-project.zip -d .
+```
