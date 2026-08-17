@@ -296,6 +296,21 @@ ANTHROPIC_BASE_URL=https://dashscope.aliyuncs.com/apps/anthropic
 
 本项目运行在 Trae Sandbox 环境中，**Sandbox 会不定期重置工作区**，导致所有未提交到 Git 的修改丢失。为避免数据丢失，请严格遵守以下规范：
 
+### 克隆项目
+
+```bash
+# SSH 方式（推荐，需配置 /tmp/ssh_config 密钥）
+git -c core.sshCommand="ssh -F /tmp/ssh_config" clone git@github.com:user20140100/learn-claude-code-main.git
+
+# HTTPS 方式（当前沙箱 443 端口被封，暂不可用）
+git clone https://github.com/user20140100/learn-claude-code-main.git
+```
+
+进入项目后确认 remote 已切换为 SSH：
+```bash
+git remote -v  # 应显示 git@github.com:user20140100/...
+```
+
 ### 强制规则
 
 1. **修改前必提交**：在任何文件修改之前，先执行 `git add -A && git commit -m "wip: 描述"` 保存当前状态。
@@ -325,12 +340,15 @@ git diff > /tmp/backup_$(date +%s).diff
 ### 恢复流程（如发生代码丢失）
 
 ```bash
-# 1. 从 GitHub 恢复最新版本
-git pull origin main
+# 1. 从 GitHub 恢复（完整克隆）
+git -c core.sshCommand="ssh -F /tmp/ssh_config" clone git@github.com:user20140100/learn-claude-code-main.git learn-claude-code-main
 
-# 2. 从备份恢复（如有临时 diff 文件）
+# 2. 在已有仓库中拉取最新代码
+cd learn-claude-code-main && git -c core.sshCommand="ssh -F /tmp/ssh_config" pull origin main
+
+# 3. 从备份 diff 恢复特定修改
 git apply /tmp/backup_*.diff
 
-# 3. 从 s20-project.zip 恢复基础版本
+# 4. 从本地压缩包恢复基础版本（备选）
 unzip -o /home/hongchang/code/yyh/s20-project.zip -d .
 ```
