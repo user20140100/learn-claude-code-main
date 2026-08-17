@@ -311,6 +311,38 @@ git clone https://github.com/user20140100/learn-claude-code-main.git
 git remote -v  # 应显示 git@github.com:user20140100/...
 ```
 
+### SSH 密钥管理
+
+Trae Sandbox 的 `/tmp` 目录挂载在持久磁盘上，**密钥和配置可跨重置保留**，无需每次重新生成。
+
+| 文件 | 路径 | 说明 |
+|------|------|------|
+| 私有密钥 | `/tmp/ssh_key` | 请勿上传至 GitHub，仅用于本地认证 |
+| 公有密钥 | `/tmp/ssh_key.pub` | 已添加到 GitHub 账号 |
+| SSH 配置 | `/tmp/ssh_config` | 自动指向 `/tmp/ssh_key` |
+
+公钥内容（已备案于 GitHub）：
+```
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIG1VLTwTFcYnCWHdzJSPkDyvKXRqEf49hFb9FnBoSlxp hongchang@trae-sandbox
+```
+
+验证连接：
+```bash
+ssh -F /tmp/ssh_config -T git@github.com
+# 成功输出：Hi user20140100! You've successfully authenticated...
+```
+
+> ⚠️ 若密钥文件丢失（如 Sandbox 异常），重新生成并添加公钥到 GitHub：
+> ```bash
+> ssh-keygen -t ed25519 -C "hongchang@trae-sandbox" -f /tmp/ssh_key -N ""
+> # 将 /tmp/ssh_key.pub 内容添加到 GitHub → Settings → SSH and GPG keys
+> cat > /tmp/ssh_config << 'EOF'
+> Host github.com
+>     IdentityFile /tmp/ssh_key
+>     IdentitiesOnly yes
+> EOF
+> ```
+
 ### 强制规则
 
 1. **修改前必提交**：在任何文件修改之前，先执行 `git add -A && git commit -m "wip: 描述"` 保存当前状态。
