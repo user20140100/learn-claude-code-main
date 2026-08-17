@@ -31,14 +31,10 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 if os.getenv("ANTHROPIC_BASE_URL"):
-    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
-
-# GitHub Token：用于 github_fetch / github_clone 工具（可选，公开仓库无需设置）
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+    GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 if GITHUB_TOKEN:
-    print(f"[config] GITHUB_TOKEN 已加载，配额: 5000次/小时")
-else:
-    print("[config] GITHUB_TOKEN 未设置，github_fetch 对公开仓库仍可工作（受限 60次/小时）")
+    print(f"[config] GITHUB_TOKEN loaded, limit: 5000/hr")
+    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
 WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
@@ -505,10 +501,7 @@ PROMPT_SECTIONS = {
         "asks to go online. Default is offline. Always cite sources after web_search.\n"
         "10. PARALLEL CALLS: independent tool calls in the same turn should be batched "
         "in one message (up to 5). Sequential only when one call's result feeds the next.\n"
-        "11. GITHUB TOOLS: for SWE-bench / GitHub issue tasks, use "
-        "github_fetch(repo, filepath, commit) to read a single file, or "
-        "github_clone(repo, commit) to clone the full repo. After finishing, "
-        "always call sandbox_cleanup() to reclaim disk space."
+        "11. GITHUB TOOLS: for SWE-bench / GitHub issue tasks, use github_fetch(repo, filepath, commit) to read a single file, or github_clone(repo, commit) to clone the full repo. After finishing, always call sandbox_cleanup() to reclaim disk space."
     ),
     "workspace": f"Working directory: {WORKDIR}",
     "memory": "Relevant memories are injected below when available.",
