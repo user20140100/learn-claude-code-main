@@ -12,6 +12,8 @@ teams, protocols, autonomous agents, worktrees, and MCP.
 """
 
 import ast, json, os, subprocess, time, random, threading, re, uuid, shutil
+import urllib.request
+import base64
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, asdict, field
@@ -29,6 +31,9 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 if os.getenv("ANTHROPIC_BASE_URL"):
+    GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+    if GITHUB_TOKEN:
+        print(f"[config] GITHUB_TOKEN loaded, limit: 5000/hr")
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
 WORKDIR = Path.cwd()
@@ -189,6 +194,113 @@ WORKTREES_DIR = WORKDIR / ".worktrees"
 WORKTREES_DIR.mkdir(exist_ok=True)
 
 VALID_WT_NAME = re.compile(r'^[A-Za-z0-9._-]{1,64}$')
+
+# --- GitHub Sandbox Tools ---
+SANDBOXES_DIR = WORKDIR / ".sandboxes"
+SANDBOXES_DIR.mkdir(exist_ok=True)
+_active_sandboxes: dict[str, str] = {}
+
+
+def _github_api_get(path, token="", timeout=15):
+    url = "https://api.github.com" + path
+    headers = {"Accept": "application/vnd.github+json"}
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+def run_github_fetch(repo, filepath, commit, token=""):
+    data = _github_api_get("/repos/" + repo + "/contents/" + filepath + "?ref=" + commit, token)
+    if not data or "content" not in data:
+        return "Error: cannot fetch " + repo + "/" + filepath + "@" + commit[:8]
+    try:
+        raw = base64.b64decode(data["content"]).decode("utf-8")
+        size_kb = len(raw) // 1024
+        return "# " + repo + "/" + filepath + " @ " + commit[:8] + " (" + str(size_kb) + "KB)\n" + raw
+    except Exception as e:
+        return "Error: Base64 decode failed: " + str(e)
+
+
+def run_github_clone(repo, commit, sandbox_name="", token=""):
+    import urllib.parse
+    if not sandbox_name:
+        safe_name = repo.replace("/", "__") + "__" + commit[:8]
+    else:
+        safe_name = re.sub(r'[^A-Za-z0-9._-]', '_', sandbox_name)
+    sandbox_path = SANDBOXES_DIR / safe_name
+    if sandbox_path.exists() and (sandbox_path / ".git").exists():
+        r = subprocess.run(["git", "-C", str(sandbox_path), "fetch",
+                            "https://github.com/" + repo + ".git", commit],
+                           capture_output=True, timeout=60)
+        if r.returncode != 0:
+            return "Error: fetch failed: " + r.stderr.decode()[:200]
+        r2 = subprocess.run(["git", "-C", str(sandbox_path), "reset", "--hard", "FETCH_HEAD"],
+                            capture_output=True, timeout=30)
+        if r2.returncode != 0:
+            return "Error: reset failed: " + r2.stderr.decode()[:200]
+        _active_sandboxes[safe_name] = str(sandbox_path)
+        return "Reused sandbox: " + str(sandbox_path)
+    clone_url = "https://github.com/" + repo + ".git"
+    if token:
+        clone_url = clone_url.replace("https://", "https://" + token + "@")
+    r = subprocess.run(["git", "clone", "--depth", "1", "--single-branch",
+                        clone_url, str(sandbox_path)],
+                       capture_output=True, text=True, timeout=120)
+    if r.returncode != 0:
+        return "Error: clone failed: " + r.stderr[:300]
+    r2 = subprocess.run(["git", "-C", str(sandbox_path), "checkout", commit],
+                        capture_output=True, text=True, timeout=30)
+    if r2.returncode != 0:
+        return "Warning: checkout " + commit[:8] + " failed; using HEAD"
+    _active_sandboxes[safe_name] = str(sandbox_path)
+    total_files = sum(1 for _ in sandbox_path.rglob("*") if _.is_file())
+    return "Cloned " + repo + "@" + commit[:8] + " to " + str(sandbox_path) + " (" + str(total_files) + " files)"
+
+
+def run_sandbox_cleanup(names=None):
+    targets = names if names is not None else list(_active_sandboxes.keys())
+    cleaned = 0
+    errors = []
+    for name in targets:
+        path = Path(_active_sandboxes.pop(name, ""))
+        if not path or not path.exists():
+            errors.append(name + ": not found")
+            continue
+        try:
+            shutil.rmtree(path, ignore_errors=True)
+            cleaned += 1
+        except Exception as e:
+            errors.append(name + ": " + str(e))
+    if names is None:
+        for child in SANDBOXES_DIR.iterdir():
+            if child.is_dir():
+                try:
+                    shutil.rmtree(child, ignore_errors=True)
+                except Exception:
+                    pass
+    msg = "Cleaned " + str(cleaned) + "/" + str(len(targets)) + " sandboxes"
+    if errors:
+        msg += "; errors: " + ", ".join(errors[:3])
+    return msg
+
+
+def run_list_sandboxes():
+    if not _active_sandboxes:
+        return "No active sandboxes."
+    lines = []
+    for name, path in _active_sandboxes.items():
+        p = Path(path)
+        size = sum(f.stat().st_size for f in p.rglob("*") if f.is_file()) if p.exists() else 0
+        size_mb = size / (1024 * 1024)
+        files = sum(1 for _ in p.rglob("*") if _.is_file()) if p.exists() else 0
+        lines.append("  " + name + ": " + str(path) + "  (" + str(files) + " files, " + str(round(size_mb, 1)) + "MB)")
+    return "\n".join(lines)
+
 
 
 def validate_worktree_name(name: str) -> str | None:
@@ -393,7 +505,8 @@ PROMPT_SECTIONS = {
         "9. WEB TOOLS ARE OPT-IN: web_search/web_fetch only when the user explicitly "
         "asks to go online. Default is offline. Always cite sources after web_search.\n"
         "10. PARALLEL CALLS: independent tool calls in the same turn should be batched "
-        "in one message (up to 5). Sequential only when one call's result feeds the next."
+        "in one message (up to 5). Sequential only when one call's result feeds the next.\n"
+        "11. GITHUB TOOLS: for SWE-bench / GitHub issue tasks, use github_fetch(repo, filepath, commit) to read a single file, or github_clone(repo, commit) to clone the full repo. After finishing, always call sandbox_cleanup() to reclaim disk space."
     ),
     "workspace": f"Working directory: {WORKDIR}",
     "memory": "Relevant memories are injected below when available.",
@@ -2853,6 +2966,8 @@ BUILTIN_HANDLERS = {
     "grep": run_grep, "ls": run_ls, "delete_file": run_delete_file,
     "diagnostics": run_diagnostics,
     "web_search": run_web_search, "web_fetch": run_web_fetch,
+    "github_fetch": run_github_fetch, "github_clone": run_github_clone,
+    "sandbox_cleanup": run_sandbox_cleanup, "list_sandboxes": run_list_sandboxes,
     "todo_write": run_todo_write, "task": spawn_subagent,
     "load_skill": load_skill,
     "create_task": run_create_task, "list_tasks": run_list_tasks,

@@ -186,6 +186,7 @@ cd web && npm run build
 - **权限治理**: 项目教学中包含权限系统设计（s03_permission），包含沙箱隔离、审批流程等
 - **MCP 安全**: s19_mcp_plugin 涉及外部工具接入，需注意信任边界
 - **Worktree 隔离**: s18_worktree_isolation 确保任务在独立目录中执行
+- **GitHub Sandbox**: s20_comprehensive 集成 GitHub API 工具，支持 SWE-bench 任务（需 GITHUB_TOKEN）
 
 ## Configuration
 
@@ -198,6 +199,7 @@ cd web && npm run build
 | `MODEL_POOL` | 是 | 模型池，逗号分隔；额度耗尽时按顺序自动切换到下一个 |
 | `ANTHROPIC_BASE_URL` | 否 | 兼容 Anthropic 的第三方端点（不填则默认 Anthropic 官方） |
 | `FALLBACK_MODEL_ID` | 否 | （遗留）单模型降级，已被 `MODEL_POOL` 取代，无需配置 |
+| `GITHUB_TOKEN` | 否 | GitHub Personal Access Token，用于 SWE-bench 任务（可选） |
 
 ### 当前实际配置（阿里云百炼）
 
@@ -291,3 +293,96 @@ ANTHROPIC_BASE_URL=https://dashscope.aliyuncs.com/apps/anthropic
 ```
 
 这样 Trae 内置终端和代码跳转都会自动使用 `.venv`，避免误用系统 Python。
+
+## ⚠️ 代码安全规范（必读）
+
+本项目运行在 Trae Sandbox 环境中，**Sandbox 会不定期重置工作区**，导致所有未提交到 Git 的修改丢失。为避免数据丢失，请严格遵守以下规范：
+
+### 克隆项目
+
+```bash
+# SSH 方式（推荐，需配置 /tmp/ssh_config 密钥）
+git -c core.sshCommand="ssh -F /tmp/ssh_config" clone git@github.com:user20140100/learn-claude-code-main.git
+
+# HTTPS 方式（当前沙箱 443 端口被封，暂不可用）
+git clone https://github.com/user20140100/learn-claude-code-main.git
+```
+
+进入项目后确认 remote 已切换为 SSH：
+```bash
+git remote -v  # 应显示 git@github.com:user20140100/...
+```
+
+### SSH 密钥管理
+
+Trae Sandbox 的 `/tmp` 目录挂载在持久磁盘上，**密钥和配置可跨重置保留**，无需每次重新生成。
+
+| 文件 | 路径 | 说明 |
+|------|------|------|
+| 私有密钥 | `/tmp/ssh_key` | 请勿上传至 GitHub，仅用于本地认证 |
+| 公有密钥 | `/tmp/ssh_key.pub` | 已添加到 GitHub 账号 |
+| SSH 配置 | `/tmp/ssh_config` | 自动指向 `/tmp/ssh_key` |
+
+公钥内容（已备案于 GitHub）：
+```
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIG1VLTwTFcYnCWHdzJSPkDyvKXRqEf49hFb9FnBoSlxp hongchang@trae-sandbox
+```
+
+验证连接：
+```bash
+ssh -F /tmp/ssh_config -T git@github.com
+# 成功输出：Hi user20140100! You've successfully authenticated...
+```
+
+> ⚠️ 若密钥文件丢失（如 Sandbox 异常），重新生成并添加公钥到 GitHub：
+> ```bash
+> ssh-keygen -t ed25519 -C "hongchang@trae-sandbox" -f /tmp/ssh_key -N ""
+> # 将 /tmp/ssh_key.pub 内容添加到 GitHub → Settings → SSH and GPG keys
+> cat > /tmp/ssh_config << 'EOF'
+> Host github.com
+>     IdentityFile /tmp/ssh_key
+>     IdentitiesOnly yes
+> EOF
+> ```
+
+### 强制规则
+
+1. **修改前必提交**：在任何文件修改之前，先执行 `git add -A && git commit -m "wip: 描述"` 保存当前状态。
+2. **频繁推送**：每次完成一个逻辑单元（一个函数、一个工具、一个阶段），立即 `git push` 到远端。
+3. **大改动分段提交**：禁止一次性修改超过 500 行代码而不提交。每完成一个独立功能点就提交一次。
+
+### 安全操作清单
+
+```bash
+# 操作前检查状态
+git status --short | head -20
+
+# 修改后立即提交
+git add <修改的文件> && git commit -m "feat: 描述" && git push
+
+# 重要修改前备份到 GitHub
+git diff > /tmp/backup_$(date +%s).diff
+```
+
+### 禁止行为
+
+- ❌ 禁止在执行长时间任务（>60秒）前不提交代码
+- ❌ 禁止一次性编辑多个相关文件后集中提交（应逐文件提交）
+- ❌ 禁止在工作区有大量未提交修改时重启终端或切换会话
+- ❌ 禁止依赖本地文件做持久化存储（所有持久数据必须 push 到 Git）
+
+### 恢复流程（如发生代码丢失）
+
+```bash
+# 1. 从 GitHub 恢复（完整克隆）
+git -c core.sshCommand="ssh -F /tmp/ssh_config" clone git@github.com:user20140100/learn-claude-code-main.git learn-claude-code-main
+
+# 2. 在已有仓库中拉取最新代码
+cd learn-claude-code-main && git -c core.sshCommand="ssh -F /tmp/ssh_config" pull origin main
+
+# 3. 从备份 diff 恢复特定修改
+git apply /tmp/backup_*.diff
+
+# 4. 从本地压缩包恢复基础版本（备选）
+unzip -o /home/hongchang/code/yyh/s20-project.zip -d .
+```

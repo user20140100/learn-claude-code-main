@@ -1,0 +1,22 @@
+[
+  {
+    "instance_id": "astropy__astropy-12907",
+    "status": "no_repo",
+    "resolved": false,
+    "fail_to_pass_result": null,
+    "pass_to_pass_result": null,
+    "apply_status": null,
+    "error": "无法获取仓库 astropy/astropy@d16bfe05",
+    "elapsed_s": 5.0
+  },
+  {
+    "instance_id": "astropy__astropy-14182",
+    "status": "no_repo",
+    "resolved": false,
+    "fail_to_pass_result": null,
+    "pass_to_pass_result": null,
+    "apply_status": null,
+    "error": "无法获取仓库 astropy/astropy@a5917978",
+    "elapsed_s": 22.3
+  }
+]
