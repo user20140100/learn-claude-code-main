@@ -67,6 +67,19 @@ CONTEXT_LIMIT = 50000
 KEEP_RECENT_TOOL_RESULTS = 3
 PERSIST_THRESHOLD = 30000
 CONTINUATION_PROMPT = "Continue from the previous response. Do not repeat completed work."
+
+# ── Goal Mode 常量 ──
+MAX_GOAL_ROUNDS = int(os.getenv("MAX_GOAL_ROUNDS", "100"))     # goal 最大执行轮数
+GOAL_COMPACT_EVERY = 10                                          # 每 N 轮对 goal context 执行压缩
+GOALS_DIR = WORKDIR / ".goals"                                   # goal 持久化目录
+GOALS_DIR.mkdir(exist_ok=True)
+
+# goal 状态常量
+GOAL_STATE_RUNNING = "GOAL_RUNNING"
+GOAL_STATE_PAUSED = "GOAL_PAUSED"
+GOAL_STATE_AWAITING_PERMISSION = "GOAL_AWAITING_PERMISSION"
+GOAL_STATE_COMPLETED = "GOAL_COMPLETED"
+GOAL_STATE_TERMINATED = "GOAL_TERMINATED"
 PROMPT = "\033[36ms20 >> \033[0m"
 CLI_ACTIVE = False
 _current_session_id: str = ""  # 当前 agent_loop 的会话 ID，供工具 handler 读取
@@ -184,6 +197,59 @@ def complete_task(task_id: str) -> str:
     if unblocked:
         msg += f"\nUnblocked: {', '.join(unblocked)}"
     return msg
+
+
+# ── Goal Mode ──
+
+# goal 持久化目录
+GOALS_DIR = GOALS_DIR  # already defined above
+
+
+@dataclass
+class Goal:
+    """Goal 数据类：表示一个用户设定的执行目标，独立维护上下文与状态"""
+    id: str                              # UUID
+    session_id: str                      # 所属 session
+    description: str                     # 用户描述的目标（goal 启动时完整输入）
+    state: str                           # 状态常量（GOAL_RUNNING / PAUSED / ...）
+    context: dict                        # Goal Context（messages、todo、task_state 等）
+    round_count: int                     # 已执行轮数
+    max_rounds: int                      # 最大轮数上限
+    start_time: str                      # ISO 格式
+    last_resume_time: str | None         # 最近恢复时间
+    paused_at: str | None                # 暂停时间
+    completed_at: str | None             # 完成时间
+    pause_reason: str | None             # 暂停原因（permission / user / error / step_limit）
+    pending_permission: dict | None      # 待审批的权限请求（含 tool_name、tool_input、reason、options）
+    summary: str | None                  # 完成后的模型生成摘要
+    log_path: str | None                 # 执行日志文件路径
+    original_messages_snapshot: list     # 启动时保存的 messages 快照（用于创建 goal context）
+
+
+class GoalLogger:
+    """Goal 执行日志器：将 goal 的关键事件写入结构化日志文件"""
+
+    def __init__(self, goal_id: str, log_path: str):
+        self.goal_id = goal_id
+        self._path = Path(log_path)
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = open(self._path, "a", encoding="utf-8")
+
+    def log(self, event_type: str, **fields):
+        """写入一条结构化日志行，格式：[timestamp] EVENT_TYPE key=value ..."""
+        ts = datetime.now().isoformat()
+        parts = [f"{k}={v!r}" for k, v in fields.items()]
+        line = f"[{ts}] {event_type:20s} {'  '.join(parts)}\n"
+        self._fh.write(line)
+        self._fh.flush()
+        # 同时打印到终端
+        print(f"\033[90m{line.rstrip()}033[0m")
+
+    def close(self):
+        """关闭日志文件句柄"""
+        if self._fh:
+            self._fh.close()
+            self._fh = None
 
 
 # ── Worktree System ──
@@ -1699,7 +1765,10 @@ threading.Thread(target=_cleanup_dormant_background, daemon=True).start()
 # Hooks are intentionally outside tool handlers. The loop can add permission,
 # logging, and stop behavior without changing each individual tool.
 HOOKS = {"UserPromptSubmit": [], "PreToolUse": [],
-         "PostToolUse": [], "Stop": []}
+         "PostToolUse": [], "Stop": [],
+         # goal 生命周期 hooks
+         "GoalStart": [], "GoalPause": [], "GoalResume": [],
+         "GoalComplete": [], "GoalTerminate": []}
 
 
 def register_hook(event: str, callback):
@@ -1743,11 +1812,13 @@ def permission_hook(block):
                 print(f"  command: {command}")
                 break
         if any(token in command for token in DESTRUCTIVE):
-            print(f"\n\033[33m[permission] destructive command\033[0m")
-            print(f"  {command}")
-            choice = input("  Allow? [y/N] ").strip().lower()
-            if choice not in ("y", "yes"):
-                return "Permission denied by user"
+            # 返回 AWAITING_PERMISSION 信号，由 agent_loop 层统一处理暂停
+            return {
+                "type": "AWAITING_PERMISSION",
+                "tool_name": "bash",
+                "tool_input": {"command": command},
+                "reason": "Potentially destructive command",
+            }
     # 路径安全校验：所有接收 path 参数的文件类工具都必须通过 safe_path
     if block.name in ("write_file", "edit_file", "read_file"):
         path = block.input.get("path", "")
@@ -1782,11 +1853,88 @@ def permission_hook(block):
             except Exception:
                 return f"Permission denied: path escapes workspace: {p}"
     if block.name.startswith("mcp__") and "deploy" in block.name:
-        print(f"\n\033[33m[permission] MCP destructive-looking tool: {block.name}\033[0m")
-        choice = input("  Allow? [y/N] ").strip().lower()
-        if choice not in ("y", "yes"):
-            return "Permission denied by user"
+        # MCP 危险工具也返回 AWAITING_PERMISSION 信号
+        return {
+            "type": "AWAITING_PERMISSION",
+            "tool_name": block.name,
+            "tool_input": block.input,
+            "reason": "MCP destructive-looking tool",
+        }
     return None
+
+
+def show_permission_dialog(goal_id: str, perm_request: dict) -> str:
+    """展示权限审批界面，等待用户选择。
+
+    返回选择结果：
+      - "allow"   批准执行
+      - "deny"    拒绝，终止 goal
+      - "edit:<cmd>"  编辑命令后批准
+    """
+    tool_name = perm_request.get("tool_name", "unknown")
+    tool_input = perm_request.get("tool_input", {})
+    reason = perm_request.get("reason", "")
+
+    # 提取命令/参数用于展示
+    if tool_name == "bash":
+        cmd_display = tool_input.get("command", "")
+    else:
+        cmd_display = str(tool_input)
+
+    print(f"\n\033[33m{'─' * 40}\033[0m")
+    print(f"\033[33m⚠  权限审批 [goal: {goal_id[:8]}]\033[0m")
+    print(f"\033[33m{'─' * 40}\033[0m")
+    print(f"  工具: {tool_name}")
+    print(f"  原因: {reason}")
+    print(f"  命令: {cmd_display}")
+    print(f"\033[33m{'─' * 40}\033[0m")
+    print("  1. allow   - 批准执行")
+    print("  2. deny    - 拒绝，终止当前 goal")
+    print("  3. edit    - 编辑命令后批准（进入编辑模式）")
+    print(f"\033[33m{'─' * 40}\033[0m")
+
+    while True:
+        try:
+            choice = input("  请输入选择 [1/2/3]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return "deny"
+        if choice in ("1", "allow", "y", "yes"):
+            return "allow"
+        elif choice in ("2", "deny", "n", "no"):
+            return "deny"
+        elif choice in ("3", "edit"):
+            # 编辑模式：让用户输入新命令
+            print("\n  输入新命令（空行取消编辑）:")
+            try:
+                new_cmd = input("  > ").strip()
+            except (EOFError, KeyboardInterrupt):
+                return "deny"
+            if not new_cmd:
+                continue  # 空行返回选项列表
+            if tool_name == "bash":
+                return f"edit:{new_cmd}"
+            else:
+                # 非 bash 工具暂不支持编辑，当作 allow
+                return "allow"
+        # 无效输入，重新提示
+
+
+def apply_permission_choice(choice: str, perm_request: dict) -> tuple:
+    """根据用户选择返回处理结果。
+
+    Returns:
+      (blocked_reason, new_input) — blocked_reason 非 None 表示拒绝；
+      new_input 非 None 表示用新输入替换原工具输入
+    """
+    if choice == "deny":
+        return ("Permission denied by user", None)
+    elif choice.startswith("edit:"):
+        new_cmd = choice[5:]
+        if perm_request.get("tool_name") == "bash":
+            return (None, {"command": new_cmd})
+        return (None, perm_request.get("tool_input"))
+    else:  # allow
+        return (None, None)
 
 
 def log_hook(block):
@@ -1823,6 +1971,12 @@ register_hook("PreToolUse", permission_hook)
 register_hook("PreToolUse", log_hook)
 register_hook("PostToolUse", large_output_hook)
 register_hook("Stop", stop_hook)
+# goal 生命周期 hook（默认实现为空操作）
+register_hook("GoalStart", lambda gid, desc: None)
+register_hook("GoalPause", lambda gid, reason: None)
+register_hook("GoalResume", lambda gid, src: None)
+register_hook("GoalComplete", lambda gid, ok, summary: None)
+register_hook("GoalTerminate", lambda gid, reason: None)
 
 
 # ── Subagent Tool ──
@@ -3179,6 +3333,231 @@ def get_latest_session_id() -> str | None:
     return sessions[0]["id"] if sessions else None
 
 
+# ── Goal Manager ──
+
+def _goal_file_path(goal_id: str) -> Path:
+    """返回 goal 持久化文件路径"""
+    return GOALS_DIR / f"{goal_id}.json"
+
+
+def _goal_log_file_path(goal_id: str) -> Path:
+    """返回 goal 日志文件路径"""
+    return GOALS_DIR / f"{goal_id}.log"
+
+
+class GoalManager:
+    """Goal 管理器：负责 goal 的创建、暂停、恢复、完成、终止等生命周期操作"""
+
+    def __init__(self, sm=None):
+        self._sm = sm                         # SessionManager 引用（可为 None）
+        self._goals: dict[str, Goal] = {}     # 内存中的 goal 索引（goal_id → Goal）
+        self._loggers: dict[str, GoalLogger] = {}  # goal_id → GoalLogger 实例
+
+    # ── 创建 ──────────────────────────────────────────────────
+
+    def create_goal(self, description: str, max_rounds: int,
+                    session_id: str, sm=None) -> Goal:
+        """创建新 goal：从当前 session history 浅拷贝 messages，初始化状态"""
+        # 保存原始用户输入快照（只取 user 消息）
+        original_snapshot = []
+        if sm and sm.history:
+            for msg in sm.history:
+                if msg.get("role") == "user":
+                    original_snapshot.append(msg)
+
+        goal = Goal(
+            id=str(uuid.uuid4()),
+            session_id=session_id,
+            description=description,
+            state=GOAL_STATE_RUNNING,
+            context={"messages": list(sm.history) if sm and sm.history else []},
+            round_count=0,
+            max_rounds=max_rounds,
+            start_time=datetime.now().isoformat(),
+            last_resume_time=None,
+            paused_at=None,
+            completed_at=None,
+            pause_reason=None,
+            pending_permission=None,
+            summary=None,
+            log_path=str(_goal_log_file_path("")),  # 稍后设置
+            original_messages_snapshot=original_snapshot,
+        )
+        # 设置日志文件路径并初始化 logger
+        goal.log_path = str(_goal_log_file_path(goal.id))
+        logger = GoalLogger(goal.id, goal.log_path)
+        self._loggers[goal.id] = logger
+        goal_logger_ref = logger  # 保留引用以便后续写入
+
+        # 写启动日志
+        logger.log("GOAL_START", goal_id=goal.id, description=description,
+                   max_rounds=max_rounds)
+
+        # 触发 GoalStart hook
+        trigger_hooks("GoalStart", goal.id, description)
+
+        # 保存到内存索引
+        self._goals[goal.id] = goal
+        # 持久化到磁盘
+        self._save_goal(goal)
+        # 更新 session 索引中的 goal_ids
+        if sm:
+            self._update_session_goal_ids(sm.session_id, goal.id, add=True)
+
+        print(f"\033[36m[goal] 已创建 goal: {goal.id[:8]} — {description}\033[0m")
+        return goal
+
+    # ── 暂停 ──────────────────────────────────────────────────
+
+    def pause_goal(self, goal: Goal, reason: str,
+                   pending_permission: dict = None) -> None:
+        """暂停 goal：持久化状态到磁盘，触发 GoalPause hook"""
+        goal.state = GOAL_STATE_PAUSED
+        goal.paused_at = datetime.now().isoformat()
+        goal.pause_reason = reason
+        goal.pending_permission = pending_permission
+        self._save_goal(goal)
+        if goal.log_path and goal.id in self._loggers:
+            self._loggers[goal.id].log("GOAL_PAUSE", goal_id=goal.id, reason=reason)
+        trigger_hooks("GoalPause", goal.id, reason)
+        print(f"\033[33m[goal] goal {goal.id[:8]} 已暂停 (原因: {reason})\033[0m")
+
+    # ── 恢复 ──────────────────────────────────────────────────
+
+    def resume_goal(self, goal_id: str) -> Goal | None:
+        """从磁盘加载并恢复 goal，返回恢复后的 Goal 对象"""
+        goal = self._load_goal(goal_id)
+        if goal is None:
+            return None
+        goal.state = GOAL_STATE_RUNNING
+        goal.last_resume_time = datetime.now().isoformat()
+        goal.paused_at = None
+        goal.pause_reason = None
+        goal.pending_permission = None
+        self._goals[goal_id] = goal
+        self._save_goal(goal)
+        if goal.log_path and goal_id in self._loggers:
+            self._loggers[goal_id].log("GOAL_RESUME", goal_id=goal_id)
+        trigger_hooks("GoalResume", goal_id, "user_continue")
+        print(f"\033[32m[goal] goal {goal_id[:8]} 已恢复执行\033[0m")
+        return goal
+
+    # ── 完成 ──────────────────────────────────────────────────
+
+    def complete_goal(self, goal: Goal, success: bool,
+                      summary: str = "") -> None:
+        """完成 goal：持久化状态、写日志、触发 GoalComplete hook"""
+        goal.state = GOAL_STATE_COMPLETED
+        goal.completed_at = datetime.now().isoformat()
+        goal.summary = summary
+        self._save_goal(goal)
+        if goal.log_path and goal.id in self._loggers:
+            self._loggers[goal.id].log("GOAL_COMPLETE", goal_id=goal.id,
+                                        success=success, rounds=goal.round_count)
+        trigger_hooks("GoalComplete", goal.id, success, summary)
+        status_str = "✓ 成功" if success else "✗ 超时终止"
+        print(f"\033[32m[goal] goal {goal.id[:8]} 已{status_str} (rounds={goal.round_count})\033[0m")
+
+    # ── 终止 ──────────────────────────────────────────────────
+
+    def terminate_goal(self, goal: Goal, reason: str) -> None:
+        """终止 goal：持久化状态、写日志、触发 GoalTerminate hook"""
+        goal.state = GOAL_STATE_TERMINATED
+        goal.completed_at = datetime.now().isoformat()
+        goal.pause_reason = reason
+        self._save_goal(goal)
+        if goal.log_path and goal.id in self._loggers:
+            self._loggers[goal.id].log("GOAL_TERMINATE", goal_id=goal.id, reason=reason)
+        trigger_hooks("GoalTerminate", goal.id, reason)
+        print(f"\033[31m[goal] goal {goal.id[:8]} 已终止 (原因: {reason})\033[0m")
+
+    # ── 查询 ──────────────────────────────────────────────────
+
+    def get_active_goal(self, session_id: str) -> Goal | None:
+        """获取指定 session 中正在运行的 goal"""
+        for g in self._goals.values():
+            if g.session_id == session_id and g.state == GOAL_STATE_RUNNING:
+                return g
+        return None
+
+    def get_paused_goal(self, session_id: str) -> Goal | None:
+        """获取指定 session 中已暂停的 goal"""
+        for g in self._goals.values():
+            if g.session_id == session_id and g.state in (GOAL_STATE_PAUSED,
+                    GOAL_STATE_AWAITING_PERMISSION):
+                return g
+        return None
+
+    def get_goal(self, goal_id: str) -> Goal | None:
+        """查询单个 goal（内存或磁盘）"""
+        if goal_id in self._goals:
+            return self._goals[goal_id]
+        goal = self._load_goal(goal_id)
+        if goal:
+            self._goals[goal_id] = goal
+        return goal
+
+    def list_goals(self, session_id: str) -> list[Goal]:
+        """列出指定 session 下的所有 goal（含历史）"""
+        return [g for g in self._goals.values() if g.session_id == session_id]
+
+    # ── 内部方法 ──────────────────────────────────────────────
+
+    def _save_goal(self, goal: Goal) -> None:
+        """将 goal 序列化到磁盘"""
+        data = asdict(goal)
+        # GoalLogger 不可序列化，跳过
+        _tmp = GoalLogger.__dict__ if False else None
+        _ = _tmp  # 防止未使用警告
+        _goal_file_path(goal.id).write_text(json.dumps(data, indent=2, default=str))
+
+    def _load_goal(self, goal_id: str) -> Goal | None:
+        """从磁盘加载 goal"""
+        path = _goal_file_path(goal_id)
+        if not path.exists():
+            return None
+        data = json.loads(path.read_text())
+        goal = Goal(**data)
+        # 重新初始化 logger（磁盘没有这个属性）
+        if goal.log_path:
+            goal.log_path = str(_goal_log_file_path(goal_id))
+            logger = GoalLogger(goal_id, goal.log_path)
+            self._loggers[goal_id] = logger
+        return goal
+
+    def _update_session_goal_ids(self, session_id: str, goal_id: str,
+                                  add: bool = True) -> None:
+        """在 session 索引中记录/删除 goal_id"""
+        idx_path = SESSIONS_DIR / "index.json"
+        index = {}
+        if idx_path.exists():
+            try:
+                index = json.loads(idx_path.read_text())
+            except json.JSONDecodeError:
+                index = {}
+        if session_id not in index:
+            index[session_id] = {}
+        sid = index[session_id]
+        if "goal_ids" not in sid:
+            sid["goal_ids"] = []
+        if add:
+            if goal_id not in sid["goal_ids"]:
+                sid["goal_ids"].append(goal_id)
+        else:
+            sid["goal_ids"] = [gid for gid in sid.get("goal_ids", [])
+                               if gid != goal_id]
+        idx_path.write_text(json.dumps(index, indent=2))
+
+    def close_all_loggers(self) -> None:
+        """关闭所有活跃 logger（程序退出时调用）"""
+        for logger in self._loggers.values():
+            try:
+                logger.close()
+            except Exception:
+                pass
+        self._loggers.clear()
+
+
 # 会话管理器：以间接引用层持有当前活动会话的 history/context/session_id，
 # 使 cron 守护线程能在会话切换后读取到最新引用
 class SessionManager:
@@ -3194,6 +3573,8 @@ class SessionManager:
         self._session_id: str = ""        # 当前会话 ID
         # 标题是否已生成标记：新会话为 False，首轮对话后触发；加载/切换的会话为 True
         self._title_generated: bool = False
+        # Goal 管理器引用（由外部初始化后注入）
+        self.goal_manager: GoalManager | None = None
 
     # 通过 property 暴露 history，确保每次访问都读取最新引用
     @property
@@ -3216,6 +3597,8 @@ class SessionManager:
     # 开启全新会话：重置 history 并基于空消息重建 context
     def start_new(self, session_id: str):
         """创建新会话：初始化空的 history 和 context"""
+        # 暂停当前 session 的 goal（如有）
+        self._pause_active_goal()
         self._session_id = session_id
         self._history = []
         self._context = update_context({}, [])
@@ -3224,18 +3607,44 @@ class SessionManager:
     # 从已落盘的 history 恢复会话状态（重启后继续对话）
     def load(self, session_id: str, history: list, context: dict):
         """加载已有会话：从 JSONL 恢复 history，重建 context"""
+        self._pause_active_goal()
         self._session_id = session_id
         self._history = history
         self._context = context
         self._title_generated = True  # 已加载的会话不需要再生成标题
+        # 自动恢复该 session 下已暂停的 goal
+        self._auto_resume_goal()
 
     # 切换到另一个会话：整体替换内部引用，必须在 agent_lock 内调用以保证线程安全
     def switch_to(self, session_id: str, history: list, context: dict):
         """切换会话：替换内部引用（必须在 agent_lock 内调用）"""
+        self._pause_active_goal()
         self._session_id = session_id
         self._history = history
         self._context = context
         self._title_generated = True  # 切换到的会话不需要再生成标题
+        # 自动恢复目标 session 下已暂停的 goal
+        self._auto_resume_goal()
+
+    def _pause_active_goal(self):
+        """暂停当前 session 中正在运行的 goal（切换 session 时调用）"""
+        if self.goal_manager and self._session_id:
+            active = self.goal_manager.get_active_goal(self._session_id)
+            if active:
+                self.goal_manager.pause_goal(active, "session_switch")
+                paused = self.goal_manager.get_paused_goal(self._session_id)
+                if paused:
+                    print(f"\033[33m[goal] 已暂停 goal {paused.id[:8]} "
+                          f"(原因: session 切换)\033[0m")
+
+    def _auto_resume_goal(self):
+        """自动恢复当前 session 下已暂停的 goal（切换 session 时调用）"""
+        if self.goal_manager and self._session_id:
+            paused = self.goal_manager.get_paused_goal(self._session_id)
+            if paused:
+                resumed = self.goal_manager.resume_goal(paused.id)
+                if resumed:
+                    print(f"\033[32m[goal] 自动恢复 goal {resumed.id[:8]}\033[0m")
 
 
 # ── Agent Loop ──
@@ -3273,8 +3682,12 @@ def inject_background_notifications(messages: list, session_id: str = ""):
 
 
 def call_llm(messages: list, context: dict, tools: list,
-             state: RecoveryState, max_tokens: int):
+             state: RecoveryState, max_tokens: int,
+             system_prefix: str = ""):
+    """调用 LLM，system_prefix 为可选的系统提示前缀（goal 模式下追加）"""
     system = assemble_system_prompt(context)
+    if system_prefix:
+        system = system + system_prefix
     return with_retry(
         lambda: client.messages.create(
             model=state.current_model,
@@ -3285,12 +3698,98 @@ def call_llm(messages: list, context: dict, tools: list,
         state)
 
 
-def agent_loop(messages: list, context: dict, session_id: str = ""):
+def _deposit_goal_to_session(goal: Goal, goal_manager, session_id: str):
+    """Goal 完成后将摘要沉淀到 Session Context 和 Memory。
+
+    调用模型生成执行摘要，并将 goal_description + goal_summary 追加到
+    session history 和 MEMORY.md。
+    """
+    try:
+        # 构造摘要 prompt
+        desc = goal.description
+        # 从 messages 中提取关键 user/assistant 交互
+        key_msgs = []
+        for msg in goal.context.get("messages", [])[-20:]:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                text = extract_text(content)
+            else:
+                text = str(content)
+            if text and len(text) > 5:
+                key_msgs.append(f"{role}: {text[:300]}")
+        summary_input = "\n".join(key_msgs[-30:]) if key_msgs else "(无交互记录)"
+
+        prompt = (
+            f"目标：{desc}\n\n"
+            f"以下是 goal 执行过程中的关键交互（最近 30 条）：\n{summary_input}\n\n"
+            f"请生成一段简洁的 goal 执行摘要（不超过 200 字），包括：\n"
+            f"1. 完成了哪些工作\n"
+            f"2. 关键决策点\n"
+            f"3. 最终结果\n\n"
+            f"摘要："
+        )
+        try:
+            resp = client.messages.create(
+                model=MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=500)
+            summary_text = extract_text(resp.content).strip()
+        except Exception:
+            summary_text = f"执行了 {goal.round_count} 轮，完成目标：{desc}"
+
+        # 追加到 session history
+        deposit_msg = {
+            "role": "system",
+            "content": (
+                f"[GOAL COMPLETE] description=\"{desc}\"  "
+                f"rounds={goal.round_count}  status=completed\n"
+                f"摘要：{summary_text}"
+            )
+        }
+        # 需要通过 sm.history 写入，此处返回消息供调用方追加
+        # 同时追加到 memory
+        if MEMORY_INDEX.exists():
+            MEMORY_INDEX.write_text(
+                MEMORY_INDEX.read_text() + "\n\n" +
+                f"## Goal: {desc}\n"
+                f"- 轮数: {goal.round_count}\n"
+                f"- 摘要: {summary_text}\n"
+            )
+        else:
+            MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+            MEMORY_INDEX.write_text(
+                f"## Goal: {desc}\n"
+                f"- 轮数: {goal.round_count}\n"
+                f"- 摘要: {summary_text}\n"
+            )
+        return deposit_msg
+    except Exception as e:
+        print(f"\033[33m[goal] 沉淀失败: {e}\033[0m")
+        return None
+
+
+def agent_loop(messages: list, context: dict, session_id: str = "",
+               goal=None, goal_manager=None):
+    """Agent 主循环。goal 和 goal_manager 为 None 时为普通对话模式，完全兼容原有行为。"""
     global rounds_since_todo, _current_session_id
     _current_session_id = session_id
     tools, handlers = assemble_tool_pool()
     state = RecoveryState()
     max_tokens = DEFAULT_MAX_TOKENS
+
+    # ── Goal Mode 初始化 ──
+    goal_active = goal is not None
+    goal_logger = None
+    if goal_active and goal_manager:
+        # 从 goal_manager 获取 logger 实例
+        goal_logger = goal_manager._loggers.get(goal.id)
+        # goal context 的 messages 作为当前操作对象
+        messages = goal.context["messages"]
+        # 设置 goal 系统提示前缀
+        system_prefix = f"\n\n[GOAL MODE] Current goal: {goal.description}\nYou are executing a goal. Work until you determine it is complete."
+    else:
+        system_prefix = ""
 
     while True:
         # One cycle: inject scheduled/background work, prepare context, call
@@ -3317,7 +3816,8 @@ def agent_loop(messages: list, context: dict, session_id: str = ""):
         tools, handlers = assemble_tool_pool()
 
         try:
-            response = call_llm(messages, context, tools, state, max_tokens)
+            response = call_llm(messages, context, tools, state, max_tokens,
+                                system_prefix=system_prefix)
         except AllModelsExhaustedError as e:
             # 所有模型免费额度都已耗尽：给出明确的"无 token"提示并优雅退出
             notice = ("[无可用模型] 所有模型的免费额度均已耗尽，"
@@ -3330,17 +3830,44 @@ def agent_loop(messages: list, context: dict, session_id: str = ""):
             print(f"\033[31m[无token] {e}\033[0m")
             print(f"\033[31m[无token] 已耗尽模型："
                   f"{', '.join(state.model_pool.exhausted)}\033[0m")
+            # goal 模式下：配额耗尽也触发暂停
+            if goal_active and goal_manager:
+                goal_manager.pause_goal(goal, "error",
+                                        pending_permission={"error": str(e)})
             return
         except Exception as e:
             if is_prompt_too_long_error(e) and not state.has_attempted_reactive_compact:
                 messages[:] = reactive_compact(messages)
                 state.has_attempted_reactive_compact = True
                 continue
+            err_msg = f"[Error] {type(e).__name__}: {e}"
             messages.append({"role": "assistant", "content": [
-                {"type": "text", "text": f"[Error] {type(e).__name__}: {e}"}]})
+                {"type": "text", "text": err_msg}]})
             if session_id:
                 log_message_to_jsonl(session_id, messages[-1])
+            # goal 模式下：LLM 错误触发暂停
+            if goal_active and goal_manager:
+                goal_manager.pause_goal(goal, "error",
+                                        pending_permission={"error": str(e)})
             return
+
+        # ── Goal 轮数检查（T2.2）─────────────────────────────
+        if goal_active:
+            goal.round_count += 1
+            if goal_logger:
+                goal_logger.log("ROUND_COUNT", round=goal.round_count,
+                                max=goal.max_rounds)
+            if goal.round_count >= goal.max_rounds:
+                messages.append({"role": "assistant", "content": [
+                    {"type": "text", "text":
+                     "[Goal 完成] 达到最大轮数上限，goal 自动终止。"}]})
+                if goal_logger:
+                    goal_logger.log("STEP_LIMIT_REACHED", round=goal.round_count)
+                # T2.3: 沉淀到 session context（超时时也返回 deposit）
+                deposit_msg = _deposit_goal_to_session(goal, goal_manager, session_id)
+                goal_manager.complete_goal(goal, success=False,
+                                           summary="[超时] 达到最大轮数上限")
+                return deposit_msg
 
         if response.stop_reason == "max_tokens":
             if not state.has_escalated:
@@ -3364,8 +3891,23 @@ def agent_loop(messages: list, context: dict, session_id: str = ""):
         messages.append({"role": "assistant", "content": response.content})
         if session_id:
             log_message_to_jsonl(session_id, messages[-1], state.current_model)
+
+        # ── Goal 上下文压缩（每 GOAL_COMPACT_EVERY 轮）──────────
+        if goal_active and goal.round_count > 0 and \
+                goal.round_count % GOAL_COMPACT_EVERY == 0:
+            messages[:] = compact_history(messages, session_id)
+            messages.append({"role": "user",
+                             "content": "[Compacted. Continue with summarized context.]"})
+            if goal_logger:
+                goal_logger.log("COMPACT", round=goal.round_count)
+
         if not has_tool_use(response.content):
-            trigger_hooks("Stop", messages)
+            # goal 模式下：模型自行判断完成，触发沉淀和 hook
+            if goal_active and goal_manager:
+                _deposit_goal_to_session(goal, goal_manager, session_id)
+                goal_manager.complete_goal(goal, success=True, summary="")
+            else:
+                trigger_hooks("Stop", messages)
             return
 
         results = []
@@ -3384,12 +3926,48 @@ def agent_loop(messages: list, context: dict, session_id: str = ""):
                 compacted_now = True
                 break
 
-            blocked = trigger_hooks("PreToolUse", block)
-            if blocked:
-                results.append({"type": "tool_result",
-                                "tool_use_id": block.id,
-                                "content": str(blocked)})
-                continue
+            # T3.2: 处理 permission 信号
+            hook_result = trigger_hooks("PreToolUse", block)
+            if hook_result is not None:
+                if isinstance(hook_result, dict) and \
+                        hook_result.get("type") == "AWAITING_PERMISSION":
+                    # 权限审批信号：暂停 goal 并展示审批界面
+                    if goal_active and goal_manager:
+                        goal_manager.pause_goal(
+                            goal, "permission",
+                            pending_permission=hook_result)
+                    # 展示审批界面
+                    goal_id_for_dialog = goal.id if goal_active else "unknown"
+                    choice = show_permission_dialog(goal_id_for_dialog, hook_result)
+                    blocked_reason, new_input = \
+                        apply_permission_choice(choice, hook_result)
+                    if blocked_reason:
+                        # 用户拒绝
+                        results.append({"type": "tool_result",
+                                        "tool_use_id": block.id,
+                                        "content": blocked_reason})
+                        # 用户拒绝 → 终止 goal
+                        if goal_active and goal_manager:
+                            goal_manager.terminate_goal(goal, "permission_denied")
+                        continue
+                    else:
+                        # 批准或编辑：用新 input 继续执行（整轮取消策略）
+                        if goal_active and goal_manager:
+                            # 恢复 goal 以便继续执行
+                            goal = goal_manager.resume_goal(goal.id)
+                        # 整轮取消：记录提示让模型重新决策
+                        results.append({"type": "tool_result",
+                                        "tool_use_id": block.id,
+                                        "content": (
+                                            "Permission was reviewed. "
+                                            "Please re-issue this action.")})
+                        break  # 整轮取消，跳出 tool_use 循环
+                else:
+                    # 原有硬拒绝逻辑（字符串）
+                    results.append({"type": "tool_result",
+                                    "tool_use_id": block.id,
+                                    "content": str(hook_result)})
+                    continue
 
             if should_run_background(block.name, block.input):
                 bg_id = start_background_task(block, handlers, session_id)
@@ -3404,6 +3982,10 @@ def agent_loop(messages: list, context: dict, session_id: str = ""):
             output = call_tool_handler(handler, block.input, block.name)
             trigger_hooks("PostToolUse", block, output)
             print(str(output)[:300])
+
+            if goal_logger:
+                goal_logger.log("TOOL_EXEC", name=block.name,
+                                args=str(block.input)[:100])
 
             if block.name == "todo_write":
                 rounds_since_todo = 0
@@ -3640,13 +4222,20 @@ def handle_cli_command(query: str, sm: SessionManager) -> bool:
 
     elif cmd in ("/help", "/h", "/?"):
         # 显示帮助
-        print("\033[36m[session] 可用命令:")
-        print("  /new              创建新会话")
-        print("  /sessions         列出所有历史会话")
-        print("  /resume [id]      恢复指定会话（无参数则恢复最近的）")
-        print("  /rename <title>   重命名当前会话")
-        print("  /branch [title]   分支当前会话")
-        print("  /help             显示此帮助\033[0m")
+        help_text = "\033[36m[session] 可用命令:\n"
+        help_text += "  /new              创建新会话\n"
+        help_text += "  /sessions         列出所有历史会话\n"
+        help_text += "  /resume [id]      恢复指定会话（无参数则恢复最近的）\n"
+        help_text += "  /rename <title>   重命名当前会话\n"
+        help_text += "  /branch [title]   分支当前会话\n"
+        help_text += "  /goal <描述>      启动新 goal（goal 模式）\n"
+        help_text += "  /goal <N> <描述>  启动 goal 并指定最大轮数\n"
+        help_text += "  /pause            暂停当前 goal\n"
+        help_text += "  /continue         恢复当前暂停的 goal\n"
+        help_text += "  /status           查看当前 goal 状态\n"
+        help_text += "  /goal list        列出当前 session 所有 goal\n"
+        help_text += "  /help             显示此帮助\033[0m"
+        print(help_text)
         return True
 
     else:
@@ -3654,14 +4243,161 @@ def handle_cli_command(query: str, sm: SessionManager) -> bool:
         return True
 
 
+def _handle_goal_command(query: str, sm: SessionManager,
+                          goal_manager: GoalManager) -> bool:
+    """处理 goal 相关 CLI 命令，返回 True 表示已处理。
+
+    支持命令：/goal, /goal list, /goal show, /goal cancel,
+             /pause, /continue, /status
+    """
+    parts = query.strip().split(maxsplit=1)
+    cmd = parts[0].lower()
+    rest = parts[1] if len(parts) > 1 else ""
+    sub_parts = rest.split(maxsplit=1) if rest else []
+    sub_cmd = sub_parts[0].lower() if sub_parts else ""
+    arg = sub_parts[1] if len(sub_parts) > 1 else ""
+
+    # ── /pause ─────────────────────────────────────────────
+    if cmd == "/pause":
+        active = goal_manager.get_active_goal(sm.session_id)
+        if not active:
+            print("\033[33m[goal] 当前没有运行中的 goal\033[0m")
+            return True
+        with agent_lock:
+            goal_manager.pause_goal(active, "user_pause")
+        return True
+
+    # ── /continue ──────────────────────────────────────────
+    elif cmd == "/continue":
+        paused = goal_manager.get_paused_goal(sm.session_id)
+        if not paused:
+            print("\033[33m[goal] 当前没有暂停的 goal\033[0m")
+            return True
+        with agent_lock:
+            resumed = goal_manager.resume_goal(paused.id)
+            if resumed:
+                pass  # 恢复后由主循环继续执行
+        return True
+
+    # ── /status ────────────────────────────────────────────
+    elif cmd == "/status":
+        active = goal_manager.get_active_goal(sm.session_id)
+        paused = goal_manager.get_paused_goal(sm.session_id)
+        if active:
+            print(f"\033[36m[goal] 运行中: {active.id[:8]}\033[0m")
+            print(f"  描述: {active.description}")
+            print(f"  轮数: {active.round_count}/{active.max_rounds}")
+            print(f"  状态: {active.state}")
+        elif paused:
+            print(f"\033[33m[goal] 已暂停: {paused.id[:8]} (原因: {paused.pause_reason})\033[0m")
+            print(f"  描述: {paused.description}")
+            print(f"  轮数: {paused.round_count}/{paused.max_rounds}")
+            print(f"  运行 /continue 继续")
+        else:
+            print("\033[90m[goal] 当前无活跃 goal\033[0m")
+        return True
+
+    # ── /goal ──────────────────────────────────────────────
+    elif cmd == "/goal":
+        # /goal list
+        if sub_cmd == "list":
+            goals = goal_manager.list_goals(sm.session_id)
+            if not goals:
+                print("\033[33m[goal] 当前 session 无 goal\033[0m")
+            else:
+                print(f"\033[36m[goal] 共 {len(goals)} 个 goal:\033[0m")
+                for g in goals:
+                    state_emoji = {"GOAL_RUNNING": "▶", "GOAL_PAUSED": "⏸",
+                                   "GOAL_COMPLETED": "✓", "GOAL_TERMINATED": "✗"
+                                   }.get(g.state, "?")
+                    desc = g.description[:40]
+                    rounds = f"rounds={g.round_count}" if g.round_count else "-"
+                    print(f"  {state_emoji} [{g.id[:8]}] {desc}  ({rounds}, {g.state})")
+            return True
+
+        # /goal show <id>
+        if sub_cmd == "show":
+            goal_id = arg.strip()
+            if not goal_id:
+                print("\033[33m[goal] 用法: /goal show <id>\033[0m")
+                return True
+            goal = goal_manager.get_goal(goal_id)
+            if not goal:
+                print(f"\033[31m[goal] 未找到 goal: {goal_id}\033[0m")
+                return True
+            print(f"\033[36m[goal] 详情 [{goal.id[:8]}]\033[0m")
+            print(f"  状态:  {goal.state}")
+            print(f"  描述:  {goal.description}")
+            print(f"  轮数:  {goal.round_count}/{goal.max_rounds}")
+            print(f"  创建:  {goal.start_time}")
+            if goal.completed_at:
+                print(f"  完成:  {goal.completed_at}")
+            if goal.pause_reason:
+                print(f"  暂停原因: {goal.pause_reason}")
+            if goal.summary:
+                print(f"  摘要:  {goal.summary[:100]}")
+            return True
+
+        # /goal cancel <id>
+        if sub_cmd == "cancel":
+            goal_id = arg.strip()
+            if not goal_id:
+                print("\033[33m[goal] 用法: /goal cancel <id>\033[0m")
+                return True
+            goal = goal_manager.get_goal(goal_id)
+            if not goal:
+                print(f"\033[31m[goal] 未找到 goal: {goal_id}\033[0m")
+                return True
+            if goal.state in (GOAL_STATE_COMPLETED, GOAL_STATE_TERMINATED):
+                print(f"\033[33m[goal] goal {goal.id[:8]} 已结束，无需取消\033[0m")
+                return True
+            goal_manager.terminate_goal(goal, "user_cancel")
+            return True
+
+        # /goal <N> <description> 或 /goal <description>
+        max_rounds = MAX_GOAL_ROUNDS
+        description = rest.strip()
+        try:
+            first_token = rest.split()[0]
+            if first_token.isdigit():
+                max_rounds = int(first_token)
+                description = " ".join(rest.split()[1:])
+        except (IndexError, ValueError):
+            pass
+
+        if not description:
+            print("\033[33m[goal] 用法: /goal <描述>\033[0m")
+            return True
+
+        active = goal_manager.get_active_goal(sm.session_id)
+        if active:
+            print(f"\033[33m[goal] 当前已有运行中 goal {active.id[:8]}，"
+                  "请先 /pause 或等待其完成\033[0m")
+            return True
+
+        with agent_lock:
+            goal = goal_manager.create_goal(
+                description=description,
+                max_rounds=max_rounds,
+                session_id=sm.session_id,
+                sm=sm)
+        print(f"\033[36m[goal] goal {goal.id[:8]} 开始执行「{description}」\033[0m")
+        return True
+
+    return False  # 非 goal 命令，交由 handle_cli_command 处理
+
+
 if __name__ == "__main__":
     CLI_ACTIVE = True
     print("s20: comprehensive agent")
     print("Enter a question, press Enter to send. Type q to quit.")
-    print("Commands: /new /sessions /resume /rename /branch\n")
+    print("Commands: /new /sessions /resume /rename /branch /goal /pause /continue /status\n")
 
     # 初始化会话管理器
     sm = SessionManager()
+    # 初始化 Goal 管理器并注入到 SessionManager
+    goal_manager = GoalManager(sm)
+    sm.goal_manager = goal_manager
     new_session_id = str(uuid.uuid4())
     sm.start_new(new_session_id)
     now = datetime.now().isoformat()
@@ -3676,83 +4412,96 @@ if __name__ == "__main__":
         try:
             query = input(PROMPT)
         except (EOFError, KeyboardInterrupt):
-            break
-        if query.strip().lower() in ("q", "exit", ""):
-            # 退出前清理当前会话临时文件并更新索引
-            if len(sm.history) > 0:
-                update_session_in_index(sm.session_id,
-                                        updated_at=datetime.now().isoformat(),
-                                        message_count=len(sm.history),
-                                        file_size=session_file_path(sm.session_id).stat().st_size if session_file_path(sm.session_id).exists() else 0)
-            # 清理当前会话的临时文件
-            cleanup_report = _FILE_TRACKER.cleanup(session_id=sm.session_id)
-            if cleanup_report:
-                print(f"\033[33m[file-tracker] 退出时清理了 {len(cleanup_report)} 个临时文件\033[0m")
-                for r in cleanup_report:
-                    ph = Path(r.get("placeholder", ""))
-                    marker = f" → {ph.name}" if ph.name else ""
-                    print(f"  - {r['path']}{marker}")
-            else:
-                print(f"\033[33m[file-tracker] 退出时无需清理临时文件\033[0m")
-            if len(sm.history) == 0:
-                # 空会话：删除文件和索引记录
-                path = session_file_path(sm.session_id)
-                if path.exists():
-                    path.unlink()
-                remove_session_from_index(sm.session_id)
+            # 退出时关闭所有 logger
+            goal_manager.close_all_loggers()
             break
 
-        # CLI 命令处理
+        # ── Goal 命令处理（优先级高于普通 CLI 命令）────────────
         if query.strip().startswith("/"):
+            # 先检查是否是 goal 相关命令
+            goal_handled = _handle_goal_command(query, sm, goal_manager)
+            if goal_handled:
+                continue
+            # 非 goal 命令：走普通 CLI 处理（/new /sessions 等会触发 session 切换→暂停 goal）
             handle_cli_command(query, sm)
             continue
 
-        trigger_hooks("UserPromptSubmit", query)
-        turn_start = len(sm.history)
-        user_msg = {"role": "user", "content": query}
-        sm.history.append(user_msg)
-        if sm.session_id:
-            log_message_to_jsonl(sm.session_id, user_msg)
+        # ── 普通输入处理 ──────────────────────────────────────
+        active_goal = goal_manager.get_active_goal(sm.session_id)
+        paused_goal = goal_manager.get_paused_goal(sm.session_id)
 
-        with agent_lock:
-            agent_loop(sm.history, sm.context, sm.session_id)
-            sm._context = update_context(sm.context, sm.history)
-            print_turn_assistants(sm.history, turn_start)
-
-        # 首轮对话结束后异步生成标题
-        if len(sm.history) >= 2 and not sm._title_generated:
-            sm._title_generated = True
-            # 提取首条用户消息和首条助手消息
-            first_user = ""
-            first_assistant = ""
-            for msg in sm.history:
-                if msg.get("role") == "user" and not first_user:
-                    content = msg.get("content", "")
-                    first_user = str(content)[:200] if not isinstance(content, list) else str(content[0])[:200] if content else ""
-                elif msg.get("role") == "assistant" and not first_assistant:
-                    first_assistant = extract_text(msg.get("content", ""))[:200]
-                if first_user and first_assistant:
-                    break
-            if first_user:
-                # 在后台线程中异步生成标题
-                threading.Thread(
-                    target=generate_title,
-                    args=(sm.session_id, first_user, first_assistant),
-                    daemon=True
-                ).start()
-
-        inbox = consume_lead_inbox(sm.session_id, route_protocol=True)
-        if inbox:
-            def inbox_label(msg):
-                req_id = msg.get("metadata", {}).get("request_id", "")
-                suffix = f" req:{req_id}" if req_id else ""
-                return f"{msg.get('type', 'message')}{suffix}"
-
-            inbox_text = "\n".join(
-                f"From {m['from']} [{inbox_label(m)}]: "
-                f"{m['content'][:200]}" for m in inbox)
-            inbox_msg = {"role": "user", "content": f"[Inbox]\n{inbox_text}"}
-            sm.history.append(inbox_msg)
+        if active_goal:
+            # goal 运行中：所有输入进入 goal context
+            trigger_hooks("UserPromptSubmit", query)
+            goal.context["messages"].append({"role": "user", "content": query})
             if sm.session_id:
-                log_message_to_jsonl(sm.session_id, inbox_msg)
+                log_message_to_jsonl(sm.session_id,
+                                     {"role": "user", "content": query})
+            with agent_lock:
+                result = agent_loop(goal.context["messages"],
+                                    sm.context, sm.session_id,
+                                    goal=active_goal,
+                                    goal_manager=goal_manager)
+                # 若 goal 完成，将沉淀消息追加到 sm.history
+                if result:
+                    sm.history.append(result)
+            print_turn_assistants(goal.context["messages"], 0)
+
+        elif paused_goal:
+            # goal 暂停中：输入追加到 goal context，等待 /continue
+            goal.context["messages"].append({"role": "user", "content": query})
+            if sm.session_id:
+                log_message_to_jsonl(sm.session_id,
+                                     {"role": "user", "content": query})
+            print(f"\033[33m[goal] 输入已记录到 goal {paused_goal.id[:8]} "
+                  f"(运行 /continue 继续)\033[0m")
+
+        else:
+            # 普通对话模式
+            trigger_hooks("UserPromptSubmit", query)
+            turn_start = len(sm.history)
+            user_msg = {"role": "user", "content": query}
+            sm.history.append(user_msg)
+            if sm.session_id:
+                log_message_to_jsonl(sm.session_id, user_msg)
+
+            with agent_lock:
+                agent_loop(sm.history, sm.context, sm.session_id)
+                sm._context = update_context(sm.context, sm.history)
+                print_turn_assistants(sm.history, turn_start)
+
+            # 首轮对话结束后异步生成标题
+            if len(sm.history) >= 2 and not sm._title_generated:
+                sm._title_generated = True
+                first_user = ""
+                first_assistant = ""
+                for msg in sm.history:
+                    if msg.get("role") == "user" and not first_user:
+                        content = msg.get("content", "")
+                        first_user = str(content)[:200] if not isinstance(content, list) else str(content[0])[:200] if content else ""
+                    elif msg.get("role") == "assistant" and not first_assistant:
+                        first_assistant = extract_text(msg.get("content", ""))[:200]
+                    if first_user and first_assistant:
+                        break
+                if first_user:
+                    threading.Thread(
+                        target=generate_title,
+                        args=(sm.session_id, first_user, first_assistant),
+                        daemon=True
+                    ).start()
+
+            inbox = consume_lead_inbox(sm.session_id, route_protocol=True)
+            if inbox:
+                def inbox_label(msg):
+                    req_id = msg.get("metadata", {}).get("request_id", "")
+                    suffix = f" req:{req_id}" if req_id else ""
+                    return f"{msg.get('type', 'message')}{suffix}"
+
+                inbox_text = "\n".join(
+                    f"From {m['from']} [{inbox_label(m)}]: "
+                    f"{m['content'][:200]}" for m in inbox)
+                inbox_msg = {"role": "user", "content": f"[Inbox]\n{inbox_text}"}
+                sm.history.append(inbox_msg)
+                if sm.session_id:
+                    log_message_to_jsonl(sm.session_id, inbox_msg)
         print()
