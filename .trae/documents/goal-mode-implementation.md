@@ -6,6 +6,17 @@
 
 ---
 
+## 核心功能
+
+### Phase 1：核心功能
+- Goal 状态机（5 状态）
+- Goal Manager（创建、暂停、恢复、完成）
+- **Goal Evaluator（新增：独立判断器）**
+- Goal Context 管理（独立上下文、持久化、加载）
+- `/goal` 命令入口
+- `/pause` / `/continue` 交互
+- Goal 专用 Hooks
+
 ## 任务列表
 
 ### Phase 1：核心骨架（Goal 状态机 + GoalManager + Goal Context）
@@ -13,9 +24,11 @@
 #### T1.1 新增 Goal 相关常量
 **位置**: `code.py` L40 附近（全局配置区）
 **内容**:
-- `MAX_GOAL_ROUNDS = 100` — 全局最大轮数配置
+- `MAX_GOAL_ROUNDS = 100` — 全局最大轮数配置（安全出口1）
+- `MAX_GOAL_BLOCKS = 10` — 判断器连续返回 ok=false 的次数上限（安全出口2）
 - `GOAL_COMPACT_EVERY = 10` — 每 N 轮触发 goal context 压缩
 - `GOALS_DIR = WORKDIR / ".goals"` — goal 持久化目录
+- `GOAL_EVALUATOR_MODEL_ID` — 从环境变量读取的判断器模型（默认复用主模型）
 - `GOAL_STATE_RUNNING = "GOAL_RUNNING"`
 - `GOAL_STATE_PAUSED = "GOAL_PAUSED"`
 - `GOAL_STATE_AWAITING_PERMISSION = "GOAL_AWAITING_PERMISSION"`
@@ -46,7 +59,15 @@ class Goal:
     original_messages_snapshot: list     # 启动时保存的 messages 快照（用于创建 goal context）
 ```
 
-#### T1.3 新增 GoalLogger 类
+#### T1.3 新增 GoalEvaluator 类
+**位置**: `code.py` L230 附近（GoalLogger 之后）
+**内容**:
+- `GoalEvaluator(model_id: str | None)` — 接收可选的评估器模型 ID（None=复用主模型）
+- `evaluate(goal_condition: str, messages: list) -> GoalDecision` — 读取对话记录，返回判断结果
+- `GoalDecision` dataclass: `ok: bool`, `reason: str`, `impossible: bool`
+- 提示词设计：明确告知判断器只读对话、不依赖模型声明、必须看到实际输出结果
+
+#### T1.4 新增 GoalLogger 类
 **位置**: `code.py` L1690 附近（FileTracker 之后）
 **内容**:
 - `GoalLogger(goal_id, log_path)` — 初始化日志文件
@@ -101,47 +122,42 @@ class Goal:
 
 ### Phase 2：Agent Loop 改造（Goal 模式入口 + 暂停/恢复）
 
-#### T2.1 改造 agent_loop 支持 goal_context 参数
-**位置**: `code.py` L3288（agent_loop 函数定义）
+#### T2.1 改造 agent_loop 支持 goal 参数与 Goal Evaluator
+**位置**: `code.py` agent_loop 函数定义
 **内容**:
-- 新增参数 `goal: Goal = None`
+- 新增参数 `goal: Goal = None`, `goal_manager: GoalManager = None`
 - goal 为 None 时行为完全不变（普通对话模式）
 - goal 不为 None 时：
-  - 使用 `goal.context["messages"]` 作为 messages（而不是 sm.history）
-  - 轮数计数器 `round_count` 从 goal 对象读取和递增
-  - 每轮结束后检查 `round_count >= goal.max_rounds`，触发步骤限制
+  - 使用 `goal.context["messages"]` 作为 messages
+  - 轮数计数器从 goal 对象递增
+  - 每轮结束后检查 `round_count >= goal.max_rounds`（安全出口1）
   - 每 `GOAL_COMPACT_EVERY` 轮对 goal context 执行压缩
-  - tool_use block 结果追加到 goal.context["messages"]（不追加到 sm.history）
-  - 当 `stop_reason != "tool_use"` 时：
-    - 输出工具调用的文本结果
-    - 触发 `GoalComplete` hook（成功完成）
-    - 返回（不追加到 sm.history）
-- 新增 `dynamic_goal_system_prefix`：goal 启动时在 system prompt 前追加 `[GOAL MODE] Current goal: <description>`
+  - tool_use block 结果追加到 goal.context["messages"]
+- 当 `stop_reason != "tool_use"` 时，**不直接标记完成**，而是：
+  1. 检查是否有后台任务未完成 → 有则 defer（不评估）
+  2. 调用 `goal.evaluator.evaluate(goal.condition, messages)`
+  3. 若 `decision.ok=True` → 触发 GoalComplete，沉淀摘要到 session，返回 CLI
+  4. 若 `decision.ok=False` → 将 `decision.reason` 追加到 messages，`goal.consecutive_blocks += 1`，continue（自动继续下一轮）
+  5. 若 `decision.impossible=True` → 触发 GoalTerminate，告知用户
+  6. 若 `goal.consecutive_blocks >= MAX_GOAL_BLOCKS` → 触发 GoalTerminate（安全出口2）
+- 新增 `dynamic_goal_system_prefix`：goal 启动时在 system prompt 前追加 `[GOAL MODE] Current goal: <condition>`
 
-#### T2.2 在 agent_loop 中集成 goal 轮数检查
-**位置**: `code.py` L3362 附近（max_tokens 重置处）
+#### T2.2 在 agent_loop 中集成 goal 轮数检查与安全出口
+**位置**: `code.py` agent_loop 每轮结束后
 **内容**:
-- 每轮 LLM 调用后，如果 goal 不为 None：`goal.round_count += 1`
-- 检查 `goal.round_count >= goal.max_rounds`：
-  - 若达到上限，将 `{"type": "text", "text": "[Goal 完成] 达到最大轮数上限，goal 自动终止。"}` 追加到 messages
-  - 触发 `GoalComplete` hook（success=False）
-  - return
+- 每轮 LLM 调用后：`goal.round_count += 1`
+- 检查安全出口1：`goal.round_count >= goal.max_rounds` → terminate with timeout
+- 检查安全出口2：`goal.consecutive_blocks >= MAX_GOAL_BLOCKS` → terminate with block_limit
+- 检查后台任务：调用 `has_pending_background_tasks()` 判断是否需要 defer
 
 #### T2.3 goal 完成后沉淀到 Session Context
-**位置**: `code.py` T2.1 中 goal 完成分支
+**位置**: `code.py` T2.1 中 evaluator ok=true 分支
 **内容**:
-- 在 `GoalComplete` hook 触发前，调用 `generate_goal_summary(goal)`：
+- 调用 `_deposit_goal_to_session(goal, goal_manager, session_id)`：
   - 构造 prompt：将 goal.original_messages_snapshot + goal.context["messages"] 中关键内容作为上下文
   - 调用 LLM 生成摘要
-  - 返回结构化文本
-- 将摘要以 structured message 追加到 `sm.history`：
-  ```python
-  sm.history.append({
-      "role": "system",
-      "content": f"[GOAL COMPLETE] {summary_text}"
-  })
-  ```
-- 同时追加到 `MEMORY_DIR / "MEMORY.md"`（调用 memory 追加逻辑）
+  - 将摘要以 structured message 追加到 `sm.history`
+  - 同时追加到 `MEMORY_DIR / "MEMORY.md"`
 
 #### T2.4 CLI 层接入 goal 模式
 **位置**: `code.py` L3675（main while True 循环）
@@ -249,18 +265,20 @@ class Goal:
 - Session 索引中新增 `goal_ids: list[str]` 字段，记录该 session 下的 goal ID
 
 #### T4.2 Goal 列表与详情 CLI 命令
-**位置**: `code.py` L3488（handle_cli_command）
+**位置**: `code.py` `_handle_goal_command` 函数
 **内容**:
 - 新增命令处理：
-  - `/goal <description>` — 启动 goal
-  - `/goal <N> <description>` — 启动 goal 指定轮数
+  - `/goal <条件>` — 启动新 goal（条件需可验证）
+  - `/goal <N> <条件>` — 启动 goal 指定最大轮数
+  - `/goal <新条件>` — **替换**当前 goal 的完成条件并立即按新条件工作
   - `/goal list` — 列出当前 session 所有 goal
   - `/goal show <id>` — 显示 goal 详情
   - `/goal cancel <id>` — 取消 goal
-  - `/pause` — 暂停当前 goal
-  - `/continue` — 恢复当前 goal
-  - `/status` — 查看当前 goal 状态
-- 这些命令在 main loop 的 goal 检测分支中直接处理（不进入 handle_cli_command）
+  - `/goal clear` — 清除当前 goal（别名 stop/off/reset/cancel/none）
+  - `/pause` — 手动暂停当前 goal
+  - `/continue` — 恢复当前暂停的 goal
+  - `/status` — 查看当前 goal 状态（含判断器评估结果）
+- 这些命令在 main loop 的 goal 检测分支中直接处理
 
 #### T4.3 Goal 级 Memory
 **位置**: `code.py` T2.3（goal 完成沉淀逻辑中）
@@ -310,10 +328,11 @@ class Goal:
 ## 验证步骤
 
 ### V1. 基本功能验证
-1. 启动 s20，输入 `/goal 创建一个 hello.py 文件并打印 Hello World`
+1. 启动 s20，输入 `/goal 运行 python -c "print(1+1)" 直到输出为 2`
 2. 验证 goal 启动后 agent 自主执行工具调用
 3. 验证 goal 完成后输出总结并返回 CLI
 4. 验证 session context 中出现了 goal 沉淀信息
+5. **关键验证**：agent 停止工具调用后，判断器被触发——若条件未满足，reason 追加到 messages 并自动继续；若条件满足，goal 完成
 
 ### V2. 暂停/恢复验证
 1. 启动 goal，执行过程中输入 `/pause`
@@ -327,6 +346,18 @@ class Goal:
 3. 选择 1 (allow) → goal 继续，工具被执行
 4. 选择 2 (deny) → goal 终止
 5. 选择 3 (edit) → 进入编辑模式，输入新命令后批准执行
+
+### V4. 判断器验证（核心差异）
+1. 启动 goal，条件设置为 `运行 python -c "import sys; sys.exit(1)" 直到退出码为 0`
+2. 验证 agent 执行失败后，判断器返回 `ok=false`，原因追加到对话
+3. 验证主模型根据原因重新尝试（自动 continue，无需用户干预）
+4. 验证当条件真正满足时，判断器返回 `ok=true`，goal 完成
+5. 验证判断器看不到工具结果时的误判（如模型声称成功但无实际输出）
+
+### V5. 安全出口验证
+1. 设置 `MAX_GOAL_ROUNDS=3`，启动 goal
+2. 验证执行到第 3 轮后 goal 自动终止，输出超时报错
+3. 验证 `MAX_GOAL_BLOCKS` 机制：连续 N 次判断器拒绝后自动终止
 
 ### V4. 错误处理验证
 1. 启动 goal，模拟 LLM 调用失败（断网或换无效 API key）

@@ -28,8 +28,10 @@ Codex 的 Goal Mode 提供了一个更好的范式：用户设定目标 → agen
 
 | 概念 | 定义 |
 |------|------|
-| `Goal` | 用户通过 `/goal` 命令设定的一个执行目标，包含目标描述、上下文、状态等 |
+| `Goal` | 用户通过 `/goal` 命令设定的一个执行目标，包含**可验证的完成条件**、上下文、状态等 |
 | `Goal Context` | 每个 goal 独立维护的上下文副本，包含该 goal 执行过程中的 messages、工具调用历史、todo 列表等 |
+| `Goal Evaluator` | 独立的判断器（一次单独的 LLM 调用），读取对话记录后返回 `{ok, reason, impossible}`，**不负责执行任何工具** |
+| `Goal Controller` | 持有 Goal 和 Goal Evaluator，管理 goal 生命周期并在每轮结束时触发评估 |
 | `Goal Run` | goal 从启动到完成/终止/暂停的一次执行实例 |
 | `Goal State` | goal 的当前状态，见 4.1 状态机 |
 
@@ -103,7 +105,7 @@ Codex 的 Goal Mode 提供了一个更好的范式：用户设定目标 → agen
 | `GOAL_RUNNING` | goal 正在执行中 | `/goal` 命令启动，或从 PAUSED 恢复 | PAUSED, COMPLETED, TERMINATED |
 | `GOAL_PAUSED` | goal 被用户手动暂停 | 用户输入 `/pause` 或 Ctrl+C | RUNNING（用户输入 `continue`） |
 | `GOAL_AWAITING_PERMISSION` | 等待用户对工具权限审批做出选择 | 工具执行前权限检查要求用户确认 | RUNNING（批准后），TERMINATED（拒绝后取消当前 goal） |
-| `GOAL_COMPLETED` | goal 正常完成 | 模型判断目标达成，或达到步数上限 | —（终态） |
+| `GOAL_COMPLETED` | goal 正常完成 | 判断器返回 `ok=true`，或达到步数上限 | —（终态） |
 | `GOAL_TERMINATED` | goal 被终止 | 用户主动终止，或权限被拒绝且用户确认取消 | —（终态） |
 
 ### 4.3 状态转换事件
@@ -127,7 +129,7 @@ Codex 的 Goal Mode 提供了一个更好的范式：用户设定目标 → agen
 ### 5.1 进入 Goal Mode
 
 ```
-用户输入: /goal <目标描述>
+用户输入: /goal <可验证的完成条件>
     │
     ▼
 触发 UserPromptSubmit hook（goal 模式）
@@ -142,13 +144,21 @@ GoalManager 创建新 Goal 对象
 agent_loop 以 goal_context 为输入开始执行
 ```
 
+**完成条件示例（good vs bad）：**
+- ✅ `/goal 运行 pytest tests/auth 直到退出码为 0` — 可验证
+- ✅ `/goal 修复所有 lint 错误，npm run lint 输出 0 warnings` — 有明确验证方式
+- ❌ `/goal 把代码弄好` — 太模糊，判断器无法评估
+- ❌ `/goal 完成登录模块迁移` — 缺少验证方式
+
 **CLI 命令规范：**
-- `/goal <描述>` — 启动新 goal
-- `/goal <N> <描述>` — 启动 goal 并指定最大轮数 N（可选，默认使用全局上限）
+- `/goal <条件>` — 启动新 goal
+- `/goal <N> <条件>` — 启动 goal 并指定最大轮数 N（可选，默认使用全局上限）
+- `/goal 新条件` — **替换**当前 goal 的完成条件并立即按新条件工作（不暂停原 goal）
 - `/pause` — 手动暂停当前 goal
 - `/continue` — 恢复当前暂停的 goal
 - `/status` — 查看当前 goal 的状态和执行进度
 - `/goal list` — 列出当前 session 的所有 goal（含历史）
+- `/goal clear` — 清除当前 goal（别名：stop/off/reset/cancel/none）
 
 ### 5.2 Goal Context（goal 独立上下文）
 
@@ -169,15 +179,78 @@ agent_loop 以 goal_context 为输入开始执行
 4. Goal 完成后：将 Goal Context 中的关键信息（目标、完成情况、关键决策）总结后追加到 Session Context
 5. Goal 暂停时：将 Goal Context 完整序列化到磁盘文件
 
-### 5.3 Goal 停止条件
+### 5.3 Goal 停止条件（独立判断器机制）
 
-**双条件判断（模型判断 + 步数兜底）：**
+**核心设计原则：主模型负责"干活"，独立判断器负责"评判"。**
 
-1. **模型自主判断**：沿用现有 `stop_reason != "tool_use"` 逻辑。当模型认为目标已完成，输出总结性文本后退出工具调用循环。
-2. **步数上限兜底**：
-   - 全局配置 `MAX_GOAL_ROUNDS`（如 100）
-   - 每个 goal 独立计数，每执行一轮 LLM 调用 +1
-   - 达到上限时触发 `STEP_LIMIT_REACHED` 事件，goal 以超时报错状态完成
+主模型停止调用工具只说明"当前轮次结束"，不能直接等同于"目标达成"。在真正返回之前，需要一次独立的评估。
+
+#### 5.3.1 Goal 完成条件
+
+用户通过 `/goal` 命令提供**可验证的完成条件**，需包含：
+1. **结束状态**：最终要达到什么结果
+2. **验证方式**：用什么命令或输出证明
+3. **限制条件**（可选）：完成过程中不能破坏什么
+
+示例：
+```
+/goal 完成登录模块迁移，直到 pytest tests/auth 退出码为 0，并且没有修改 tests/auth 之外的测试文件
+```
+
+#### 5.3.2 Goal Evaluator（独立判断器）
+
+当主模型不再调用工具时（`stop_reason != "tool_use"`），不直接标记 goal 完成，而是触发 **Goal Stop hook**，由 `GoalEvaluator` 进行评估：
+
+```python
+# 判断器输出格式
+class GoalDecision:
+    ok: bool           # True = 条件满足，goal 完成
+    reason: str        # 简短原因（未满足时说明还需要做什么）
+    impossible: bool   # True = 目标已无法完成
+```
+
+**判断器输入**：
+- 当前 Goal 的完成条件
+- 到目前为止的完整对话记录（messages）
+- 主模型运行工具后产生的所有 tool_result
+
+**判断器限制**：
+- **无工具**：判断器只读对话，不能自己读取文件或重新运行命令
+- **不依赖模型声明**：对话中模型说"测试通过了"不足以判定完成，必须有实际的输出结果支撑
+- **模型可配置**：通过 `GOAL_EVALUATOR_MODEL_ID` 环境变量指定（默认复用主模型），建议使用更小更快的模型以降低延迟和成本
+
+#### 5.3.3 评估流程
+
+```
+主模型 stop_reason != "tool_use"
+        │
+        ▼
+  检查是否有后台任务未完成？
+        │
+   是 → 返回 defer（不评估，等待后台结果）
+        │
+   否 → 调用 GoalEvaluator(messages, goal.condition)
+        │
+        ├── ok=true  → GOAL_COMPLETED
+        │              沉淀摘要到 session context
+        │              返回 CLI
+        │
+        ├── ok=false → 将 reason 追加到 messages
+        │              主循环 continue（自动继续下一轮，无需用户操作）
+        │
+        └── impossible=true → GOAL_TERMINATED
+                               告知用户目标无法完成
+```
+
+#### 5.3.4 后台任务时的 defer 逻辑
+
+如果 goal 执行中有后台任务（background task）仍在运行，主模型停止工具调用但关键结果尚未回到对话。**此时不触发评估**，返回 `defer`。后台任务完成通知进入 messages 后，下一次主模型停止时再触发评估。
+
+#### 5.3.5 双重出口安全
+
+除判断器外，保留两道通用安全出口：
+1. **全局轮数上限** `MAX_GOAL_ROUNDS`：达到上限时 goal 以超时状态终止（`success=False`）
+2. **连续 block 次数上限** `MAX_GOAL_BLOCKS`（如 10）：判断器连续 N 次返回 `ok=false` 时，也触发终止，避免陷入死循环
 
 ### 5.4 暂停与恢复机制
 
@@ -521,19 +594,23 @@ HOOKS = {
 class Goal:
     id: str                              # UUID
     session_id: str                      # 所属 session
-    description: str                     # 用户描述的目标（goal 启动时完整输入）
-    state: str                           # GOAL_RUNNING / PAUSED / GOAL_AWAITING_PERMISSION / COMPLETED / TERMINATED
+    description: str                     # 用户输入原文（完整条件描述）
+    condition: str                       # 可验证的完成条件（同 description，别名）
+    state: str                           # 状态常量（GOAL_RUNNING / PAUSED / GOAL_AWAITING_PERMISSION / COMPLETED / TERMINATED）
     context: dict                        # Goal Context（messages、todo、task_state 等）
     round_count: int                     # 已执行轮数
     max_rounds: int                      # 最大轮数上限
+    consecutive_blocks: int              # 判断器连续返回 ok=false 的次数（安全出口计数）
     start_time: str                      # ISO 格式
     last_resume_time: str | None         # 最近恢复时间
     paused_at: str | None                # 暂停时间
     completed_at: str | None             # 完成时间
-    pause_reason: str | None             # 暂停原因（permission / user / error / step_limit）
+    pause_reason: str | None             # 暂停原因（permission / user / error / step_limit / block_limit）
     pending_permission: dict | None      # 待审批的权限请求（含 tool_name、tool_input、reason、options）
     summary: str | None                  # 完成后的模型生成摘要
     log_path: str | None                 # 执行日志文件路径
+    original_messages_snapshot: list     # 启动时保存的 messages 快照（用于创建 goal context）
+    evaluator_model: str | None          # 判断器使用的模型（None=复用主模型）
 ```
 
 ### 10.2 持久化路径
@@ -614,20 +691,22 @@ class Goal:
 
 | 决策点 | 选择 | 理由 |
 |--------|------|------|
-| 停止条件 | 模型判断 + 全局步数上限兜底 | 兼顾灵活性和安全性 |
+| **停止条件** | **独立 Goal Evaluator（非模型自判）** — 主模型停后另一次 LLM 调用读取对话，返回 `{ok, reason, impossible}`；`ok=false` 时将 reason 追加到 messages 自动 continue | 模型自己判断不可靠，独立评估器可验证实际结果 |
 | 用户输入注入 | 追加到 goal context 的 messages | 简单、与现有结构兼容 |
 | 权限暂停粒度 | **Goal 级**——任一工具需审批则暂停整个 goal | 统一控制点，用户体验一致 |
 | 暂停持久化 | 完整状态序列化到磁盘 | 支持跨会话恢复 |
 | Goal 完成后行为 | 输出总结，沉淀摘要到 session context，返回 CLI | 符合 Codex 体验 |
-| 新增 Hooks | 是，5 个 goal 专用 hook | 保持扩展性 |
-| 进入方式 | `/goal` CLI 命令 | 不破坏现有模式 |
+| 新增 Hooks | 是，5 个 goal 专用 hook + Goal Stop hook | 保持扩展性 |
+| 进入方式 | `/goal` CLI 命令（提供可验证条件） | 不破坏现有模式 |
+| **替换 Goal** | **`/goal 新条件` 直接替换，无需先 pause** | 与 s17 对齐，减少操作步骤 |
 | 并发 tool_use | 整轮取消，恢复后重算 | 简化一致性 |
 | 后台任务/Cron | 不停止，恢复后重新注入通知 | 避免中断耗时操作 |
+| **后台 defer** | **后台任务未完成时返回 defer，不触发评估** | 避免误判 |
 | 上下文压缩 | 复用现有逻辑 | 最小改动 |
 | 记忆系统 | goal 独立 context，完成后沉淀 | 隔离 + 传承 |
 | 子智能体 | 独立于 goal 暂停 | 职责分离 |
 | MCP 权限 | 走现有 permission_hook | 统一管理 |
-| 步数上限 | 全局固定值，不设时间上限 | 简单可控 |
+| **安全出口** | **双重：MAX_GOAL_ROUNDS（轮数）+ MAX_GOAL_BLOCKS（连续 block 次数）** | 防止无限循环 |
 | 错误处理 | 工具错误给模型自解，LLM 错误暂停 | 分层处理 |
 | 状态机 | 5 状态（含 GOAL_AWAITING_PERMISSION） | 平衡简洁与表达能力 |
 | Session 关系 | goal 在 session 内，切换时暂停/恢复 | 与现有 session 管理兼容 |
